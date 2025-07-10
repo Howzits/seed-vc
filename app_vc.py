@@ -55,7 +55,7 @@ def load_models(args):
         "funasr/campplus", "campplus_cn_common.bin", config_filename=None
     )
     campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
-    campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+    campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu",weights_only=True))
     campplus_model.eval()
     campplus_model.to(device)
 

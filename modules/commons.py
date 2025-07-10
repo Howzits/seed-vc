@@ -418,7 +418,8 @@ def load_checkpoint(
     is_distributed=False,
     load_ema=False,
 ):
-    state = torch.load(path, map_location="cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state = torch.load(path, map_location=device, weights_only=True)
     params = state["net"]
     if load_ema and "ema" in state:
         print("Loading EMA")
