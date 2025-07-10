@@ -1,5 +1,6 @@
 import os
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+os.environ["GRADIO_TEMP_DIR"] = "./temp"
 import gradio as gr
 import torch
 import torchaudio
@@ -358,7 +359,7 @@ def main(args):
     inputs = [
         gr.Audio(type="filepath", label="Source Audio / 源音频"),
         gr.Audio(type="filepath", label="Reference Audio / 参考音频"),
-        gr.Slider(minimum=1, maximum=200, value=10, step=1, label="Diffusion Steps / 扩散步数", info="10 by default, 50~100 for best quality / 默认为 10，50~100 为最佳质量"),
+        gr.Slider(minimum=1, maximum=200, value=25, step=1, label="Diffusion Steps / 扩散步数", info="10 by default, 50~100 for best quality / 默认为 10，50~100 为最佳质量"),
         gr.Slider(minimum=0.5, maximum=2.0, step=0.1, value=1.0, label="Length Adjust / 长度调整", info="<1.0 for speed-up speech, >1.0 for slow-down speech / <1.0 加速语速，>1.0 减慢语速"),
         gr.Slider(minimum=0.0, maximum=1.0, step=0.1, value=0.7, label="Inference CFG Rate", info="has subtle influence / 有微小影响"),
     ]
@@ -382,12 +383,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, help="Path to the checkpoint file", default=None)
-    parser.add_argument("--config", type=str, help="Path to the config file", default=None)
+    parser.add_argument("--checkpoint", type=str, help="Path to the checkpoint file", default='./pretrained/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth')
+    parser.add_argument("--config", type=str, help="Path to the config file", default='pretrained/config_dit_mel_seed_uvit_whisper_small_wavenet.yml')
     parser.add_argument("--share", type=str2bool, nargs="?", const=True, default=False, help="Whether to share the app")
     parser.add_argument("--fp16", type=str2bool, nargs="?", const=True, help="Whether to use fp16", default=True)
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
+    print(f"Using checkpoint: {args.checkpoint}")
+    print(f"Using config: {args.config}")
     cuda_target = f"cuda:{args.gpu}" if args.gpu else "cuda" 
 
     if torch.cuda.is_available():

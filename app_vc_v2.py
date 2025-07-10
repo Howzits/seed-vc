@@ -1,7 +1,9 @@
 import gradio as gr
 import torch
 import yaml
+import os
 
+os.environ["GRADIO_TEMP_DIR"] = "./temp"
 if torch.cuda.is_available():
     device = torch.device("cuda")
 elif torch.backends.mps.is_available():
