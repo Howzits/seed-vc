@@ -11,7 +11,7 @@ from faster_whisper import WhisperModel
 import hashlib
 import base64
 import librosa
-# from whisper_timestamped.transcribe import get_audio_tensor, get_vad_segments
+from whisper_timestamped.transcribe import get_audio_tensor, get_vad_segments
 
 model_size = "medium"
 # Run on GPU with FP16
@@ -133,6 +133,7 @@ def get_se(audio_path, vc_model, target_dir='processed', vad=True):
 
     audio_name = f"{os.path.basename(audio_path).rsplit('.', 1)[0]}_{version}_{hash_numpy_array(audio_path)}"
     se_path = os.path.join(target_dir, audio_name, 'se.pth')
+    print(f"Processing {se_path}")
 
     # if os.path.isfile(se_path):
     #     se = torch.load(se_path).to(device)
@@ -140,14 +141,14 @@ def get_se(audio_path, vc_model, target_dir='processed', vad=True):
     # if os.path.isdir(audio_path):
     #     wavs_folder = audio_path
     
-    # if vad:
-    #     wavs_folder = split_audio_vad(audio_path, target_dir=target_dir, audio_name=audio_name)
-    # else:
-    #     wavs_folder = split_audio_whisper(audio_path, target_dir=target_dir, audio_name=audio_name)
+    if vad:
+        wavs_folder = split_audio_vad(audio_path, target_dir=target_dir, audio_name=audio_name)
+    else:
+        wavs_folder = split_audio_whisper(audio_path, target_dir=target_dir, audio_name=audio_name)
     
-    # audio_segs = glob(f'{wavs_folder}/*.wav')
-    # if len(audio_segs) == 0:
-    #     raise NotImplementedError('No audio segments found!')
+    audio_segs = glob(f'{wavs_folder}/*.wav')
+    if len(audio_segs) == 0:
+        raise NotImplementedError('No audio segments found!')
     
     return vc_model.extract_se([audio_path], se_save_path=se_path), audio_name
 
