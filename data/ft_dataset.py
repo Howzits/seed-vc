@@ -4,6 +4,7 @@ import numpy as np
 import random
 import os
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from modules.audio import mel_spectrogram
 
 
@@ -69,14 +70,16 @@ class FT_Dataset(torch.utils.data.Dataset):
         return wave.squeeze(0), mel
 
 
-def build_ft_dataloader(data_path, spect_params, sr, batch_size=1, num_workers=0):
+def build_ft_dataloader(data_path, spect_params, sr, batch_size=1, num_workers=0, world_size=1):
     dataset = FT_Dataset(data_path, spect_params, sr, batch_size)
+    sampler =  DistributedSampler(dataset,num_replicas=world_size) if world_size > 1 else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
         num_workers=num_workers,
         collate_fn=collate,
+        sampler=sampler,
     )
     return dataloader
 
