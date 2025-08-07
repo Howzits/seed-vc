@@ -18,6 +18,9 @@ from modules.commons import recursive_munch, build_model, load_checkpoint
 from optimizers import build_optimizer
 from data.ft_dataset import build_ft_dataloader
 from hf_utils import load_custom_model_from_hf
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
 
 
 class Trainer:
@@ -34,6 +37,18 @@ class Trainer:
         max_epochs=1000,
         device="cuda:0",
     ):
+        # 初始化分布式训练
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+        if self.world_size > 1:
+            dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(self.local_rank)
+
+        # 统一使用local_rank对应的设备
+        device = f"cuda:{self.local_rank}"
+        print(f"Using device: {device}")
         self.device = device
         config = yaml.safe_load(open(config_path))
         self.log_dir = os.path.join(config["log_dir"], run_name)
@@ -65,6 +80,7 @@ class Trainer:
             self.sr,
             batch_size=batch_size,
             num_workers=num_workers,
+            world_size=self.world_size,
         )
         self.f0_condition = config["model_params"]["DiT"].get("f0_condition", False)
         self.build_sv_model(device, config)
@@ -86,6 +102,17 @@ class Trainer:
         self.model.cfm.estimator.setup_caches(
             max_batch_size=batch_size, max_seq_length=8192
         )
+
+        # 将模型移到对应GPU并用DDP包装
+        for key in self.model:
+            # self.model[key] = self.model[key].cuda(self.local_rank)
+            if self.world_size > 1:
+                self.model[key] = DDP(
+                    self.model[key],
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=True,  # 添加此参数
+                )
 
         # initialize optimizers after preparing models for compatibility with FSDP
         self.optimizer = build_optimizer(
@@ -133,7 +160,7 @@ class Trainer:
                 latest_checkpoint,
                 load_only_params=True,
                 ignore_modules=[],
-                is_distributed=False,
+                is_distributed=True,
             )
             print(f"Loaded checkpoint from {latest_checkpoint}")
         else:
@@ -420,26 +447,34 @@ class Trainer:
                 else loss
             )
             if self.iters % self.log_interval == 0:
-                print(f"epoch {self.epoch}, step {self.iters}, loss: {self.ema_loss}")
+                torch.cuda.synchronize()
+                if dist.get_rank() == 0:
+                    print(
+                        f"epoch {self.epoch}, step {self.iters}, loss: {self.ema_loss}"
+                    )
             self.iters += 1
 
             if self.iters >= self.max_steps:
                 break
 
             if self.iters % self.save_interval == 0:
-                print("Saving..")
-                state = {
-                    "net": {key: self.model[key].state_dict() for key in self.model},
-                    "optimizer": self.optimizer.state_dict(),
-                    "scheduler": self.optimizer.scheduler_state_dict(),
-                    "iters": self.iters,
-                    "epoch": self.epoch,
-                }
-                save_path = os.path.join(
-                    self.log_dir,
-                    f"DiT_epoch_{self.epoch:05d}_step_{self.iters:05d}.pth",
-                )
-                torch.save(state, save_path)
+                if dist.get_rank() == 0:
+                    print("Saving..")
+                    state = {
+                        "net": {
+                            key: self.model[key].state_dict() for key in self.model
+                        },
+                        "optimizer": self.optimizer.state_dict(),
+                        "scheduler": self.optimizer.scheduler_state_dict(),
+                        "iters": self.iters,
+                        "epoch": self.epoch,
+                    }
+                    save_path = os.path.join(
+                        self.log_dir,
+                        f"DiT_epoch_{self.epoch:05d}_step_{self.iters:05d}.pth",
+                    )
+                    torch.save(state, save_path)
+                dist.barrier()
 
                 # find all checkpoints and remove old ones
                 checkpoints = glob.glob(os.path.join(self.log_dir, "DiT_epoch_*.pth"))
@@ -453,19 +488,22 @@ class Trainer:
         self.loss_smoothing_rate = 0.99
         for epoch in range(self.n_epochs):
             self.epoch = epoch
+            self.train_dataloader.sampler.set_epoch(epoch)
             self.train_one_epoch()
             if self.iters >= self.max_steps:
                 print("Max steps reached. Finishing training..")
                 break
 
-        print("Saving final model..")
-        state = {
-            "net": {key: self.model[key].state_dict() for key in self.model},
-        }
-        os.makedirs(self.log_dir, exist_ok=True)
-        save_path = os.path.join(self.log_dir, "ft_model.pth")
-        torch.save(state, save_path)
-        print(f"Final model saved at {save_path}")
+        if dist.get_rank() == 0:
+            print("Saving final model..")
+            state = {
+                "net": {key: self.model[key].state_dict() for key in self.model},
+            }
+            os.makedirs(self.log_dir, exist_ok=True)
+            save_path = os.path.join(self.log_dir, "ft_model.pth")
+            torch.save(state, save_path)
+            print(f"Final model saved at {save_path}")
+        dist.destroy_process_group()
 
 
 def main(args):
@@ -502,11 +540,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dataset-dir", type=str, default="/path/to/dataset")
     parser.add_argument("--run-name", type=str, default="my_run")
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--max-steps", type=int, default=10000)
-    parser.add_argument("--max-epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--max-steps", type=int, default=400000)
+    parser.add_argument("--max-epochs", type=int, default=1000)
     parser.add_argument("--save-every", type=int, default=500)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
     if torch.backends.mps.is_available():
@@ -514,3 +552,4 @@ if __name__ == "__main__":
     else:
         args.device = f"cuda:{args.gpu}" if args.gpu else "cuda:0"
     main(args)
+    mp.spawn(main, args=(args,), nprocs=4, join=True)
