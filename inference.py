@@ -107,6 +107,7 @@ def load_models(args):
         from modules.bigvgan import bigvgan
 
         bigvgan_name = model_params.vocoder.name
+
         bigvgan_model = bigvgan.BigVGAN.from_pretrained(
             bigvgan_name, use_cuda_kernel=False
         )
@@ -304,11 +305,63 @@ def crossfade(chunk1, chunk2, overlap):
     return chunk2
 
 
-@torch.no_grad()
-def main(args):
+def patch(args):
+    args.output = "/99_TemporaryData/haochen75/seed_vc_training/val_converted_audio"
+    args.checkpoint = (
+        "runs/run_dit_mel_seed_uvit_whisper_small_wavenet/my_run/ft_model.pth"
+    )
+    args.config = "runs/run_dit_mel_seed_uvit_whisper_small_wavenet/my_run/config_dit_mel_seed_uvit_whisper_small_wavenet.yml"
     model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args = (
         load_models(args)
     )
+    import pandas as pd
+
+    if os.path.exists(args.output):
+        shutil.rmtree(args.output)
+    os.makedirs(args.output, exist_ok=True)
+
+    cvs_path = os.path.join(args.output, "cmpare.csv")
+
+    if os.path.exists(cvs_path):
+        os.remove(cvs_path)
+    with open(cvs_path, "w") as f:
+        writer = pd.DataFrame(columns=["ref", "src"])
+        data = []
+        for root, dirs, src_files in os.walk(
+            "/99_TemporaryData/haochen75/seed_vc_training/story_audio_train_val/val_src_clean"
+        ):
+            for src in src_files:
+                if src.endswith(".mp3") or src.endswith(".wav"):
+                    file_path = os.path.join(root, src)
+                    print(f"Processing source file: {file_path}")
+                    for ref_root, ref_dirs, ref_files in os.walk(
+                        "/99_TemporaryData/haochen75/seed_vc_training/ref_audio_split_by_dir/val_mini_one_clean"
+                    ):
+                        for ref in ref_files:
+                            if ref.endswith(".mp3") or ref.endswith(".wav"):
+                                print(f"Processing {file_path} with reference {ref}")
+                                ref_path = os.path.join(ref_root, ref)
+                                args.source = file_path
+                                args.target = ref_path
+                                data.append({"ref": ref_path, "src": file_path})
+                                main(
+                                    model,
+                                    semantic_fn,
+                                    f0_fn,
+                                    vocoder_fn,
+                                    campplus_model,
+                                    mel_fn,
+                                    mel_fn_args,
+                                )
+        writer = pd.DataFrame(data)
+        writer.to_csv(cvs_path, index=False)
+
+
+@torch.no_grad()
+def main(model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args):
+    # model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_fn_args = (
+    #     load_models(args)
+    # )
     sr = mel_fn_args["sampling_rate"]
     f0_condition = args.f0_condition
     auto_f0_adjust = args.auto_f0_adjust
@@ -322,8 +375,8 @@ def main(args):
     source_audio = librosa.load(source, sr=sr)[0]
     ref_audio = librosa.load(target_name, sr=sr)[0]
 
-    sr = 22050 if not f0_condition else 44100
-    hop_length = 256 if not f0_condition else 512
+    sr = 22050
+    hop_length = 256
     max_context_window = sr // hop_length * 30
     overlap_frame_len = 16
     overlap_wave_len = overlap_frame_len * hop_length
@@ -488,7 +541,7 @@ def main(args):
     torchaudio.save(
         os.path.join(
             args.output,
-            f"vc_{source_name}_{target_name}_{length_adjust}_{diffusion_steps}_{inference_cfg_rate}.wav",
+            f"{source_name}&{target_name}.wav",
         ),
         vc_wave.cpu(),
         sr,
@@ -503,8 +556,8 @@ if __name__ == "__main__":
     parser.add_argument("--diffusion-steps", type=int, default=30)
     parser.add_argument("--length-adjust", type=float, default=1.0)
     parser.add_argument("--inference-cfg-rate", type=float, default=0.7)
-    parser.add_argument("--f0-condition", type=str2bool, default=False)
-    parser.add_argument("--auto-f0-adjust", type=str2bool, default=False)
+    parser.add_argument("--f0-condition", type=str2bool, default=True)
+    parser.add_argument("--auto-f0-adjust", type=str2bool, default=True)
     parser.add_argument("--semi-tone-shift", type=int, default=0)
     parser.add_argument(
         "--checkpoint", type=str, help="Path to the checkpoint file", default=None
@@ -514,4 +567,23 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fp16", type=str2bool, default=True)
     args = parser.parse_args()
-    main(args)
+    # main(args)
+    patch(args)
+
+    # args.output = "/99_TemporaryData/haochen75/vc_demo/seed_vc_fine1"
+    # args.checkpoint = "pretrained/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth"
+    # args.config = "/pretrained/config_dit_mel_seed_uvit_whisper_small_wavenet.yml"
+
+    # for root,dirs,src_files in os.walk('/99_TemporaryData/haochen75/vc_demo/src_audio'):
+    #     for src in src_files:
+    #         if src.endswith(".mp3") or src.endswith(".wav"):
+    #             file_path = os.path.join(root, src)
+    #             print(f"Processing source file: {file_path}")
+    #             for ref_root,ref_dirs,ref_files in os.walk('/99_TemporaryData/haochen75/vc_demo/ref_audio'):
+    #                 for ref in ref_files:
+    #                     if ref.endswith(".mp3") or ref.endswith(".wav"):
+    #                         print(f"Processing {file_path} with reference {ref}")
+    #                         ref_path = os.path.join(ref_root, ref)
+    #                         args.source = file_path
+    #                         args.target = ref_path
+    #                         main(args)

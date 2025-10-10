@@ -6,7 +6,8 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 from functools import reduce
-from torch.optim import AdamW
+# from torch.optim import AdamW
+from CAdamW import AdamW
 
 class MultiOptimizer:
     def __init__(self, optimizers={}, schedulers={}):

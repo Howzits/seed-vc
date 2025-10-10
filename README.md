@@ -60,7 +60,7 @@ python inference.py --source <source-wav>
 --semi-tone-shift 0 # pitch shift in semitones for singing voice conversion
 --checkpoint <path-to-checkpoint>
 --config <path-to-config>
- --fp16 True
+--fp16 True
 ```
 where:
 - `source` is the path to the speech file to convert to reference voice

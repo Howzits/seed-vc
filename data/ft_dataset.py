@@ -70,17 +70,27 @@ class FT_Dataset(torch.utils.data.Dataset):
         return wave.squeeze(0), mel
 
 
-def build_ft_dataloader(data_path, spect_params, sr, batch_size=1, num_workers=0, world_size=1):
+def build_ft_dataloader(data_path, spect_params, sr, batch_size=1, num_workers=0, world_size=1, local_rank=0):
     dataset = FT_Dataset(data_path, spect_params, sr, batch_size)
-    sampler =  DistributedSampler(dataset,num_replicas=world_size) if world_size > 1 else None
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(sampler is None),
-        num_workers=num_workers,
-        collate_fn=collate,
-        sampler=sampler,
-    )
+    if world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=collate,
+            sampler=sampler,
+            shuffle=False,  # 使用DistributedSampler时需要设置为False
+            drop_last=True,
+        )
+    else:
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate,
+        )
     return dataloader
 
 def collate(batch):

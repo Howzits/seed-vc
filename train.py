@@ -21,6 +21,7 @@ from hf_utils import load_custom_model_from_hf
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
+import gc
 
 
 class Trainer:
@@ -40,24 +41,45 @@ class Trainer:
         # 初始化分布式训练
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
         if self.world_size > 1:
-            dist.init_process_group(backend="nccl")
+            # 确保所有必要的环境变量都被设置
+            os.environ.setdefault("RANK", str(self.local_rank))
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "12345")
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                rank=self.local_rank,
+                world_size=self.world_size,
+            )
+            os.environ.setdefault(
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "max_split_size_mb:128,garbage_collection_threshold:0.6",
+            )
             torch.cuda.set_device(self.local_rank)
+            torch.manual_seed(42 + self.local_rank)
+            device = f"cuda:{self.local_rank}"
 
-        # 统一使用local_rank对应的设备
-        device = f"cuda:{self.local_rank}"
-        print(f"Using device: {device}")
         self.device = device
         config = yaml.safe_load(open(config_path))
         self.log_dir = os.path.join(config["log_dir"], run_name)
-        os.makedirs(self.log_dir, exist_ok=True)
-        # copy config file to log dir
-        shutil.copyfile(
-            config_path, os.path.join(self.log_dir, os.path.basename(config_path))
-        )
+        if self.local_rank == 0:  # 只在主进程上创建日志目录
+            os.makedirs(self.log_dir, exist_ok=True)
+            # copy config file to log dir
+            shutil.copyfile(
+                config_path, os.path.join(self.log_dir, os.path.basename(config_path))
+            )
+
         batch_size = config.get("batch_size", 10) if batch_size == 0 else batch_size
+        if self.world_size > 1:
+            # interpret config batch_size as global batch size
+            per_process_batch = max(1, batch_size // self.world_size)
+            if per_process_batch != batch_size:
+                print(
+                    f"Distributed mode detected world_size {self.world_size} using per-process batch_size {per_process_batch} (global {batch_size})"
+                )
+            batch_size = per_process_batch
+        print("Batch size:", batch_size)
         self.max_steps = steps
 
         self.n_epochs = max_epochs
@@ -81,14 +103,16 @@ class Trainer:
             batch_size=batch_size,
             num_workers=num_workers,
             world_size=self.world_size,
+            local_rank=self.local_rank,
         )
         self.f0_condition = config["model_params"]["DiT"].get("f0_condition", False)
+        print("f0_condition:", self.f0_condition)
         self.build_sv_model(device, config)
         self.build_semantic_fn(device, config)
         if self.f0_condition:
             self.build_f0_fn(device, config)
         self.build_converter(device, config)
-        self.build_vocoder(device, config)
+        # self.build_vocoder(device, config)
 
         scheduler_params = {
             "warmup_steps": 0,
@@ -104,15 +128,17 @@ class Trainer:
         )
 
         # 将模型移到对应GPU并用DDP包装
-        for key in self.model:
-            # self.model[key] = self.model[key].cuda(self.local_rank)
-            if self.world_size > 1:
+        if self.world_size > 1:
+            for key in self.model:
                 self.model[key] = DDP(
                     self.model[key],
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
-                    find_unused_parameters=True,  # 添加此参数
+                    find_unused_parameters=True,
+                    bucket_cap_mb=128,
                 )
+        else:
+            _ = [self.model[key].to(device) for key in self.model]
 
         # initialize optimizers after preparing models for compatibility with FSDP
         self.optimizer = build_optimizer(
@@ -125,7 +151,7 @@ class Trainer:
             available_checkpoints = glob.glob(
                 os.path.join(self.log_dir, "DiT_epoch_*_step_*.pth")
             )
-            if len(available_checkpoints) > 0:
+            if len(available_checkpoints) > 0 and self.local_rank == 0:
                 latest_checkpoint = max(
                     available_checkpoints,
                     key=lambda x: int(x.split("_")[-1].split(".")[0]),
@@ -141,7 +167,7 @@ class Trainer:
                 ):
                     os.remove(earliest_checkpoint)
                     print(f"Removed {earliest_checkpoint}")
-            elif config.get("pretrained_model", ""):
+            elif config.get("pretrained_model", "") and self.local_rank == 0:
                 latest_checkpoint = load_custom_model_from_hf(
                     "Plachta/Seed-VC", config["pretrained_model"], None
                 )
@@ -160,12 +186,14 @@ class Trainer:
                 latest_checkpoint,
                 load_only_params=True,
                 ignore_modules=[],
-                is_distributed=True,
+                is_distributed=self.world_size > 1,
             )
+
             print(f"Loaded checkpoint from {latest_checkpoint}")
         else:
             self.epoch, self.iters = 0, 0
-            print("Failed to load any checkpoint, training from scratch.")
+            if self.local_rank == 0:
+                print("Failed to load any checkpoint, training from scratch.")
 
     def build_sv_model(self, device, config):
         from modules.campplus.DTDNN import CAMPPlus
@@ -189,7 +217,6 @@ class Trainer:
             "lj1995/VoiceConversionWebUI", "rmvpe.pt", None
         )
         self.rmvpe = RMVPE(model_path, is_half=False, device=device)
-        self.f0_fn = self.rmvpe
 
     def build_converter(self, device, config):
         from modules.openvoice.api import ToneColorConverter
@@ -204,6 +231,7 @@ class Trainer:
         self.tone_color_converter.model.eval()
         se_db_path = load_custom_model_from_hf("Plachta/Seed-VC", "se_db.pt", None)
         self.se_db = torch.load(se_db_path, map_location="cpu", weights_only=True)
+        self.se_db.to(device)
 
     def build_vocoder(self, device, config):
         vocoder_type = config["model_params"]["vocoder"]["type"]
@@ -454,6 +482,14 @@ class Trainer:
                     )
             self.iters += 1
 
+            # periodic cleanup to reduce fragmentation
+            if self.iters % 10 == 0:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                gc.collect()
+
             if self.iters >= self.max_steps:
                 break
 
@@ -488,13 +524,15 @@ class Trainer:
         self.loss_smoothing_rate = 0.99
         for epoch in range(self.n_epochs):
             self.epoch = epoch
-            self.train_dataloader.sampler.set_epoch(epoch)
+            if self.world_size > 1:
+                self.train_dataloader.sampler.set_epoch(epoch)
             self.train_one_epoch()
             if self.iters >= self.max_steps:
-                print("Max steps reached. Finishing training..")
+                if self.local_rank == 0:
+                    print("Max steps reached. Finishing training..")
                 break
 
-        if dist.get_rank() == 0:
+        if self.local_rank == 0:
             print("Saving final model..")
             state = {
                 "net": {key: self.model[key].state_dict() for key in self.model},
@@ -503,10 +541,16 @@ class Trainer:
             save_path = os.path.join(self.log_dir, "ft_model.pth")
             torch.save(state, save_path)
             print(f"Final model saved at {save_path}")
-        dist.destroy_process_group()
+        if self.world_size > 1:
+            dist.destroy_process_group()
 
 
-def main(args):
+def main(rank, args):
+    # 设置当前进程的环境变量
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["RANK"] = str(rank)
+    args.gpu = rank
+    args.device = f"cuda:{args.gpu}" if args.gpu else "cuda:0"
     trainer = Trainer(
         config_path=args.config,
         pretrained_ckpt_path=args.pretrained_ckpt,
@@ -536,20 +580,36 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pretrained-ckpt",
         type=str,
-        default="pretrained/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
+        default=None#"pretrained/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
     )
     parser.add_argument("--dataset-dir", type=str, default="/path/to/dataset")
     parser.add_argument("--run-name", type=str, default="my_run")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=56)
     parser.add_argument("--max-steps", type=int, default=400000)
-    parser.add_argument("--max-epochs", type=int, default=1000)
+    parser.add_argument("--max-epochs", type=int, default=2)
     parser.add_argument("--save-every", type=int, default=500)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=128)
     parser.add_argument("--gpu", type=int, help="Which GPU id to use", default=0)
     args = parser.parse_args()
-    if torch.backends.mps.is_available():
-        args.device = "mps"
+
+    # 检查是否使用分布式训练
+    if "WORLD_SIZE" in os.environ:
+        # 通过 torchrun 启动
+        os.environ.setdefault("RANK", os.environ["LOCAL_RANK"])
+        main(int(os.environ["LOCAL_RANK"]), args)
     else:
-        args.device = f"cuda:{args.gpu}" if args.gpu else "cuda:0"
-    main(args)
-    mp.spawn(main, args=(args,), nprocs=4, join=True)
+        # 单GPU训练或通过 mp.spawn 启动
+        if torch.cuda.device_count() > 1:
+            # 多GPU训练
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = "12345"
+            os.environ["WORLD_SIZE"] = str(torch.cuda.device_count())
+            os.environ["RANK"] = "0"  # 主进程rank为0
+            mp.spawn(main, args=(args,), nprocs=torch.cuda.device_count(), join=True)
+        else:
+            # 单GPU训练
+            if torch.backends.mps.is_available():
+                args.device = "mps"
+            else:
+                args.device = f"cuda:{args.gpu}" if args.gpu else "cuda:0"
+            main(0, args)
